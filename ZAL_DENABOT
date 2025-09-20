@@ -1,0 +1,469 @@
+# === Блок 1: Импорты и константы ===
+import telebot
+from telebot import types
+from datetime import datetime
+import sqlite3
+import time
+import logging
+import re
+import threading
+
+TOKEN = '8329374119:AAHWFWxo3M3KVNnkhf-pBsCZADM5k0F3Ub8'
+GROUP_CHAT_ID = -1002998344604
+
+bot = telebot.TeleBot(TOKEN)
+
+# Настройка логирования
+logging.basicConfig(
+    filename='bot.log',
+    level=logging.INFO,
+    format='[%(asctime)s] %(levelname)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+
+logging.info("==== Бот запущен ====")
+
+# === ID админа ===
+ADMIN_IDS = [864962887, 5945450515, 296228144, 700143435,]
+
+# === Блок 2: Подключение к базе данных и создание таблиц ===
+
+# === Блок DBManager ===
+class DBManager:
+    def __init__(self, db_name='visits.db'):
+        self.db_name = db_name
+        self.lock = threading.Lock()
+
+    def execute(self, query, params=(), fetchone=False, fetchall=False, commit=False, return_lastrowid=False):
+        with self.lock:
+            conn = sqlite3.connect(self.db_name)
+            cursor = conn.cursor()
+            try:
+                cursor.execute(query, params)
+                if commit:
+                    conn.commit()
+                if return_lastrowid:
+                    return cursor.lastrowid
+                if fetchone:
+                    return cursor.fetchone()
+                if fetchall:
+                    return cursor.fetchall()
+            finally:
+                conn.close()
+
+    def executemany(self, query, param_list, commit=False):
+        with self.lock:
+            conn = sqlite3.connect(self.db_name)
+            cursor = conn.cursor()
+            try:
+                cursor.executemany(query, param_list)
+                if commit:
+                    conn.commit()
+            finally:
+                conn.close()
+db = DBManager()
+
+# === Инициализация базы ===
+def initialize_database():
+    db.execute('''
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            fio TEXT,
+            state TEXT DEFAULT NULL
+        )
+    ''', commit=True)
+
+    db.execute('''
+        CREATE TABLE IF NOT EXISTS requests (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            date TEXT,
+            status TEXT DEFAULT 'pending'
+        )
+    ''', commit=True)
+
+    db.execute('''
+        CREATE TABLE IF NOT EXISTS schedule (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            file_id TEXT,
+            caption TEXT,
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+    ''', commit=True)
+
+    db.execute('''
+        CREATE TABLE IF NOT EXISTS payments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            file_id TEXT,
+            caption TEXT,
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+    ''', commit=True)
+
+initialize_database()
+print("Проверка SELECT:", db.execute("SELECT name FROM sqlite_master WHERE type='table'", fetchall=True))
+
+# === Блок 3: Вспомогательные функции ===
+
+def send_main_menu(user_id):
+    keyboard = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    keyboard.add("Разовое посещение", "Аренда")
+    keyboard.add("Расписание", "Свой вопрос")
+    keyboard.add("Оплата")
+    bot.send_message(user_id, "Выберите действие:", reply_markup=keyboard)
+
+def is_registered(user_id):
+    result = db.execute('SELECT fio FROM users WHERE user_id = ?', (user_id,), fetchone=True)
+    return result
+    
+def has_approved_request(user_id):
+    result = db.execute('''
+        SELECT id FROM requests
+        WHERE user_id = ? AND status = 'approved' AND datetime(date, 'start of day') >= datetime('now', 'start of day')
+        ORDER BY date LIMIT 1
+    ''', (user_id,), fetchone=True)
+    return result is not None
+
+# === Состояния пользователей (user_state) ===
+def set_user_state(user_id, state):
+    logging.debug(f"set_user_state: {user_id} -> {state}")
+    try:
+        db.execute('UPDATE users SET state = ? WHERE user_id = ?', (state, user_id), commit=True)
+        print(f"[DEBUG] set_user_state: установлено состояние {state} для пользователя {user_id}")
+    except Exception as e:
+        logging.error(f"[ERROR] set_user_state для пользователя {user_id}: {e}")
+
+
+def get_user_state(user_id):
+    try:
+        result = db.execute('SELECT state FROM users WHERE user_id = ?', (user_id,), fetchone=True)
+        return result[0] if result else None
+    except Exception as e:
+        logging.error(f"get_user_state error for user {user_id}: {e}")
+        return None
+
+# Хендлер для кнопок меню
+@bot.message_handler(func=lambda m: m.text in ["Разовое посещение", "Аренда", "Расписание", "Свой вопрос", "Оплата"])
+def handle_menu_buttons(message):
+    user_id = message.chat.id
+    text = message.text 
+    logging.info(f"Пользователь {user_id} нажал кнопку: {message.text}")
+
+    # сброс состояния пользователя при любом нажатии кнопки меню
+    set_user_state(user_id, None)
+
+    if text == "Разовое посещение":
+        bot.send_message(user_id, "Выбери день и время, важно написать как в примере:\n 25.10.2025 14:00\n Мы ответим если это возможно.\nПосле вышлем реквизиты для оплаты.")
+        set_user_state(user_id, "waiting_for_date")
+        print(f"[DEBUG] Установлено состояние: waiting_for_date для пользователя {user_id}")
+
+    elif text == "Аренда":
+        bot.send_message(user_id, "🛠 Для аренды зала напишите интересующие вас дни, часы и вид занятий нашему администратору:\n👉 @zaldena. ")
+
+    elif text == "Расписание":
+        send_schedule_if_exists(user_id)
+
+    elif text == "Свой вопрос":
+        bot.send_message(user_id, "❓ Напишите ваш вопрос администратору:\n👉 @zaldena")
+        set_user_state(user_id, "waiting_for_question")
+
+    elif text == "Оплата":
+        bot.send_message(user_id, "💳 Реквизиты для перевода:\n👉 по номеру +79220000320 на сбербанк. Пожалуйста, отправьте фото вашего чека в этот чат.")
+        set_user_state(user_id, "waiting_for_payment")
+
+# Отдельный хендлер для ожидания даты
+@bot.message_handler(func=lambda m: get_user_state(m.chat.id) == "waiting_for_date")
+def handle_waiting_for_date(message):
+    process_date(message)
+
+# === Блок 4: Обработка команды /start ===
+@bot.message_handler(commands=['start'])
+def handle_start(message):
+    user_id = message.chat.id
+    if is_registered(user_id):
+        bot.send_message(user_id, "Привет! Ты уже зарегистрирован.")
+        send_main_menu(user_id)
+    else:
+        bot.send_message(user_id, "Привет! Если ты тут первый раз, напиши,пожалуйста, свое ФИО, чтобы познакомиться.")
+        bot.register_next_step_handler(message, register_user)
+
+# === Блок 5: Регистрация пользователя ===
+def register_user(message):
+    user_id = message.chat.id
+    fio = message.text.strip()
+    db.execute(
+        'REPLACE INTO users (user_id, fio, state) VALUES (?, ?, NULL)',
+        (user_id, fio),
+        commit=True
+    )
+    bot.send_message(user_id, f"Спасибо, {fio}, вы зарегистрированы.")
+    send_main_menu(user_id)
+    logging.info(f"Зарегистрирован: {user_id} - {fio}")
+
+# === Блок 7: Обработка вопроса пользователя ===
+@bot.message_handler(func=lambda m: get_user_state(m.chat.id) == "waiting_for_question")
+def handle_question_message(message):
+    user_id = message.chat.id
+    question = message.text.strip()
+
+    row = db.execute('SELECT fio FROM users WHERE user_id = ?', (user_id,), fetchone=True)
+    fio = row[0] if row else "Неизвестный пользователь"
+
+    bot.send_message(GROUP_CHAT_ID, f"📩 Вопрос от {fio} (ID: {user_id}):\n{question}")
+    bot.send_message(user_id, "Вопрос отправлен. Мы скоро ответим.")
+    set_user_state(user_id, None)
+
+# === Блок 8: Обработка ввода даты и создание заявки ===
+def process_date(message):
+    user_id = message.chat.id
+    date_text = message.text.strip()
+
+    # Проверка формата даты через регулярку
+    if not re.match(r'^\d{2}\.\d{2}\.\d{4} \d{2}:\d{2}$', date_text):
+        bot.send_message(user_id, "❌ Неверный формат даты. Введите в формате: 25.10.2025 14:00")
+        set_user_state(user_id, "waiting_for_date")
+        logging.warning(f"[FORMAT ERROR] Пользователь {user_id} ввёл неправильную дату: {date_text}")
+        
+        # 🔁 Повторный next_step_handler
+        bot.register_next_step_handler(message, process_date)
+        return
+
+    # Теперь можно сбросить состояние
+    set_user_state(user_id, None)
+
+    try:
+        visit_datetime = datetime.strptime(date_text, "%d.%m.%Y %H:%M")
+        visit_str = visit_datetime.strftime("%d.%m.%Y %H:%M")
+
+        row = db.execute('SELECT fio FROM users WHERE user_id = ?', (user_id,), fetchone=True)
+        if not row:
+            bot.send_message(user_id, "Вы не зарегистрированы. Напишите /start для регистрации.")
+            return
+        fio = row[0]
+
+        request_id = db.execute(
+            'INSERT INTO requests (user_id, date, status) VALUES (?, ?, ?)',
+             (user_id, visit_str, 'pending'),
+            commit=True,
+            return_lastrowid=True
+        )
+        logging.debug(f"[DEBUG] Заявка создана с ID: {request_id}")
+
+
+        # Кнопки подтверждения/отклонения
+        keyboard = types.InlineKeyboardMarkup()
+        yes_btn = types.InlineKeyboardButton("✅ Подтвердить", callback_data=f"approve_{request_id}")
+        no_btn = types.InlineKeyboardButton("❌ Отклонить", callback_data=f"reject_{request_id}")
+        keyboard.add(yes_btn, no_btn)
+        print(f"[DEBUG] Кнопка approve: approve_{request_id}")
+
+
+        admin_text = (
+            f"📩 Новый запрос #{request_id}\n"
+            f"👤 ФИО: {fio}\n"
+            f"📅 Дата: {visit_str}\n\n"
+            "Подтвердить визит?"
+        )
+        bot.send_message(GROUP_CHAT_ID, admin_text, reply_markup=keyboard)
+        bot.send_message(user_id, "Ваша заявка отправлена администраторам. Примерное время ожидания - 10 минут.")
+        logging.info(f"User {user_id} ({fio}) запрашивает разовое посещение: {visit_str}")
+
+    except Exception as e:
+        logging.error(f"[PROCESS_DATE ERROR] Ошибка при обработке даты от пользователя {user_id}: {e}")
+        bot.send_message(user_id, "❌ Произошла ошибка при обработке даты. Попробуйте снова.")
+        set_user_state(user_id, "waiting_for_date")
+        bot.register_next_step_handler(message, process_date)
+
+
+
+# === Блок 9: Обработка подтверждения/отклонения заявки администратором ===
+@bot.callback_query_handler(func=lambda call: call.data.startswith("approve_") or call.data.startswith("reject_"))
+def handle_admin_decision(call):
+    action, request_id = call.data.split("_")
+    print(f"[DEBUG] Callback: action={action}, request_id={request_id}")
+
+    request_id = int(request_id)
+
+    row = db.execute('SELECT user_id, date, status FROM requests WHERE id = ?', (request_id,), fetchone=True)
+    if not row:
+        bot.answer_callback_query(call.id, "Заявка не найдена.")
+        return
+
+    user_id, date_str, status = row
+    if status != 'pending':
+        bot.answer_callback_query(call.id, "Эта заявка уже обработана.")
+        return
+   
+        db.execute('UPDATE requests SET status = ? WHERE id = ?', ('approved', request_id), commit=True)
+
+    if action == 'approve':
+
+        db.execute('UPDATE requests SET status = ? WHERE id = ?', ('approved', request_id), commit=True)
+
+        bot.send_message(user_id, f"✅ Ваша запись на {date_str} подтверждена. Ждём вас!")
+        bot.send_message(user_id, "💳 Реквизиты для оплаты:\n+7 922 000 0320\nСбербанк\nПожалуйста, отправьте фото вашего чека в этот чат для подтверждения оплаты.")
+        set_user_state(user_id, "waiting_for_payment")
+        bot.send_message(GROUP_CHAT_ID, f"✅ Заявка #{request_id} подтверждена {call.from_user.first_name}.")
+        logging.info(f"Заявка #{request_id} {'подтверждена' if action == 'approve' else 'отклонена'} админом {call.from_user.id}")
+
+
+    else:  # reject
+        db.execute('UPDATE requests SET status = ? WHERE id = ?', ('rejected', request_id), commit=True)
+
+        bot.send_message(user_id, "❌ К сожалению, мы не сможем вас впустить в это время. Пожалуйста, выберите другую дату и время.")
+        bot.send_message(GROUP_CHAT_ID, f"❌ Заявка #{request_id} отклонена {call.from_user.first_name}.")
+        bot.send_message(user_id, "Введите другую дату и время:")
+        bot.register_next_step_handler_by_chat_id(user_id, process_date)
+
+    bot.answer_callback_query(call.id)
+
+# === Блок 11: Обработка фото расписания (группа) ===
+@bot.message_handler(content_types=['photo'], chat_types=['group', 'supergroup'])
+def handle_schedule_photo_group(message):
+    if message.caption and '#расписание' in message.caption.lower():
+        file_id = message.photo[-1].file_id
+        caption = message.caption
+
+        db.execute('DELETE FROM schedule', commit=True)
+        db.execute('INSERT INTO schedule (file_id, caption) VALUES (?, ?)', (file_id, caption), commit=True)
+
+        bot.send_message(message.chat.id, "✅ Расписание сохранено в базе данных.")
+
+# === Блок 12: Обработка запроса расписания пользователем ===
+
+@bot.message_handler(func=lambda m: m.text == "Расписание")
+def handle_schedule_request(message):
+    user_id = message.chat.id
+    send_schedule_if_exists(user_id)
+
+def has_approved_request(user_id):
+    # Проверяем, есть ли у пользователя заявка со статусом 'approved'
+    row = db.execute('SELECT id FROM requests WHERE user_id = ? AND status = ?', (user_id, 'approved'), fetchone=True)
+    return row is not None
+
+@bot.message_handler(content_types=['photo'], chat_types=['private', 'group', 'supergroup'])
+def handle_photo(message):
+    user_id = message.chat.id
+    current_state = get_user_state(user_id)
+    caption = message.caption or "(без подписи)"
+    file_id = message.photo[-1].file_id
+
+    # Расписание (группа/админ)
+    if message.caption and '#расписание' in message.caption.lower():
+        if (message.chat.type == 'private' and user_id in ADMIN_IDS) or message.chat.type in ['group', 'supergroup']:
+            db.execute('DELETE FROM schedule', commit=True)
+            db.execute('INSERT INTO schedule (file_id, caption) VALUES (?, ?)', (file_id, caption), commit=True)
+            bot.send_message(user_id, "✅ Расписание обновлено.")
+            logging.info(f"Админ {user_id} загрузил новое расписание.")
+            return
+
+    # Пользователь присылает чек
+    if current_state == "waiting_for_payment":
+        if not has_approved_request(user_id):
+            bot.send_message(user_id, "❌ У вас нет одобренной заявки. Сначала подтвердите запись, прежде чем отправлять чек.")
+            logging.warning(f"Попытка отправить чек без одобренной заявки от {user_id}")
+            return
+
+        set_user_state(user_id, None)
+
+        row = db.execute('SELECT fio FROM users WHERE user_id = ?', (user_id,), fetchone=True)
+        fio = row[0] if row else "Неизвестный пользователь"
+        db.execute('INSERT INTO payments (user_id, file_id, caption) VALUES (?, ?, ?)', (user_id, file_id, caption), commit=True)
+        bot.send_photo(GROUP_CHAT_ID, file_id, caption=f"💰 Чек от {fio}:\n📝 {caption}")
+        bot.send_message(user_id, "✅ Спасибо! Чек отправлен. До встречи в зале!")
+        logging.info(f"Получен чек от пользователя {user_id}: {caption}")
+        return
+
+    bot.send_message(user_id, "❌ Не удалось определить тип изображения.")
+
+# === админсчкие кнопки ===
+
+@bot.message_handler(commands=['admin'])
+def admin_menu(message):
+    print(f"/admin вызван от {message.from_user.id}")
+    if message.from_user.id not in ADMIN_IDS:
+        bot.send_message(message.chat.id, "❌ У вас нет доступа к админ-меню.")
+        logging.warning(f"Пользователь {message.from_user.id} попытался получить доступ к /admin")
+        return
+
+    keyboard = types.InlineKeyboardMarkup()
+    keyboard.add(
+        types.InlineKeyboardButton("👥 Пользователи", callback_data="show_users"),
+        types.InlineKeyboardButton("🗓 Заявки", callback_data="show_requests"),
+        types.InlineKeyboardButton("💰 Чеки", callback_data="show_payments")
+    )
+
+    bot.send_message(message.chat.id, "🔐 Админ-меню:", reply_markup=keyboard)
+
+@bot.callback_query_handler(func=lambda call: call.data in ["show_users", "show_requests", "show_payments"])
+def handle_admin_buttons(call):
+    user_id = call.from_user.id
+    if user_id not in ADMIN_IDS:
+        bot.answer_callback_query(call.id, "❌ Нет доступа.")
+        return
+
+    if call.data == "show_users":
+        users = db.execute('SELECT user_id, fio FROM users', fetchall=True)
+        if not users:
+            bot.send_message(call.message.chat.id, "Нет зарегистрированных пользователей.")
+        else:
+            msg = "👥 Пользователи:\n"
+            for uid, fio in users:
+                msg += f"- {fio} (ID: {uid})\n"
+            bot.send_message(call.message.chat.id, msg)
+
+    elif call.data == "show_requests":
+        rows = db.execute('''
+            SELECT r.id, u.fio, r.date, r.status
+            FROM requests r
+            JOIN users u ON r.user_id = u.user_id
+            ORDER BY r.id DESC
+        ''', fetchall=True)
+        if not rows:
+            bot.send_message(call.message.chat.id, "Нет заявок.")
+        else:
+            msg = "📄 Заявки:\n"
+            for req_id, fio, date, status in rows:
+                icons = {'pending': '⏳', 'approved': '✅', 'rejected': '❌'}
+                icon = icons.get(status, '')
+                msg += f"{icon} #{req_id} — {fio}, {date} — {status.upper()}\n"
+            bot.send_message(call.message.chat.id, msg)
+
+    elif call.data == "show_payments":
+        rows = db.execute('''
+            SELECT p.id, u.fio, p.caption, p.timestamp
+            FROM payments p
+            JOIN users u ON p.user_id = u.user_id
+            ORDER BY p.timestamp DESC
+            LIMIT 20
+        ''', fetchall=True)
+        if not rows:
+            bot.send_message(call.message.chat.id, "Нет чеков.")
+        else:
+            msg = "💰 Последние чеки:\n"
+            for pid, fio, caption, ts in rows:
+                msg += f"#{pid} — {fio} — {ts}\n📎 {caption}\n\n"
+            bot.send_message(call.message.chat.id, msg)
+
+    bot.answer_callback_query(call.id)
+
+
+def send_schedule_if_exists(user_id):
+    result = db.execute('SELECT file_id, caption FROM schedule ORDER BY timestamp DESC LIMIT 1', fetchone=True)
+    if result:
+        file_id, caption = result
+        bot.send_photo(user_id, photo=file_id, caption=caption)
+    else:
+        bot.send_message(user_id, "⚠️ Расписание пока не загружено.")
+
+# === Блок 13: Запуск бота ===
+logging.info("Бот запущен... Ожидаем события.")
+while True:
+    try:
+        bot.polling(none_stop=True, interval=0)
+    except Exception as e:
+        logging.exception("Ошибка в bot.polling:")
+        time.sleep(5)
+
+        db.execute('INSERT INTO payments (user_id, file_id, caption) VALUES (?, ?, ?)', (user_id, file_id, caption), commit=True)
