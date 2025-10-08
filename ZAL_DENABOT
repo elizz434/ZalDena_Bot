@@ -69,6 +69,7 @@ def initialize_database():
         CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY,
             fio TEXT,
+            username TEXT,
             state TEXT DEFAULT NULL
         )
     ''', commit=True)
@@ -101,6 +102,16 @@ def initialize_database():
         )
     ''', commit=True)
 
+    db.execute('''
+        CREATE TABLE IF NOT EXISTS events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            file_id TEXT,
+            caption TEXT,
+            event_type TEXT,
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+       )
+   ''', commit=True)
+
 initialize_database()
 print("Проверка SELECT:", db.execute("SELECT name FROM sqlite_master WHERE type='table'", fetchall=True))
 
@@ -110,13 +121,14 @@ def send_main_menu(user_id):
     keyboard = types.ReplyKeyboardMarkup(resize_keyboard=True)
     keyboard.add("Разовое посещение", "Аренда")
     keyboard.add("Расписание", "Свой вопрос")
-    keyboard.add("Оплата")
+    keyboard.add("🎫 Оплатить мероприятие")
+    keyboard.add("Оплата")  # это старая ручная оплата
     bot.send_message(user_id, "Выберите действие:", reply_markup=keyboard)
 
 def is_registered(user_id):
     result = db.execute('SELECT fio FROM users WHERE user_id = ?', (user_id,), fetchone=True)
     return result
-    
+
 def has_approved_request(user_id):
     result = db.execute('''
         SELECT id FROM requests
@@ -147,9 +159,8 @@ def get_user_state(user_id):
 @bot.message_handler(func=lambda m: m.text in ["Разовое посещение", "Аренда", "Расписание", "Свой вопрос", "Оплата"])
 def handle_menu_buttons(message):
     user_id = message.chat.id
-    text = message.text 
+    text = message.text
     logging.info(f"Пользователь {user_id} нажал кнопку: {message.text}")
-
     # сброс состояния пользователя при любом нажатии кнопки меню
     set_user_state(user_id, None)
 
@@ -181,6 +192,9 @@ def handle_waiting_for_date(message):
 @bot.message_handler(commands=['start'])
 def handle_start(message):
     user_id = message.chat.id
+    username = message.from_user.username or ""
+    db.execute('UPDATE users SET username = ? WHERE user_id = ?', (username, user_id), commit=True)
+
     if is_registered(user_id):
         bot.send_message(user_id, "Привет! Ты уже зарегистрирован.")
         send_main_menu(user_id)
@@ -188,18 +202,34 @@ def handle_start(message):
         bot.send_message(user_id, "Привет! Если ты тут первый раз, напиши,пожалуйста, свое ФИО, чтобы познакомиться.")
         bot.register_next_step_handler(message, register_user)
 
+##Хендлер для кнопки 🎫 Оплатить мероприятие
+@bot.message_handler(func=lambda m: m.text == "🎫 Оплатить мероприятие")
+def handle_pay_event_main(message):
+    keyboard = types.ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
+    keyboard.add("🎷 Джем", "🗣 Опентолк", "🎬 Просмотр")
+    bot.send_message(message.chat.id, "Выберите мероприятие для оплаты:", reply_markup=keyboard)
+    set_user_state(message.chat.id, "choosing_event_type")
+
 # === Блок 5: Регистрация пользователя ===
 def register_user(message):
     user_id = message.chat.id
     fio = message.text.strip()
+    username = message.from_user.username 
+
+    # Проверка ФИО на недопустимые символы
+    if not re.match(r"^[А-Яа-яA-Za-zёЁ\- ]{3,}$", fio):
+        bot.send_message(user_id, "❌ Пожалуйста, введите корректное ФИО без символов вроде !@#№%:, и не короче 3 букв.\nПример: Иванов Иван")
+        bot.register_next_step_handler(message, register_user)
+        return
+
     db.execute(
-        'REPLACE INTO users (user_id, fio, state) VALUES (?, ?, NULL)',
-        (user_id, fio),
+        'REPLACE INTO users (user_id, fio, username, state) VALUES (?, ?, ?, ?)',
+        (user_id, fio, username, None),
         commit=True
     )
     bot.send_message(user_id, f"Спасибо, {fio}, вы зарегистрированы.")
     send_main_menu(user_id)
-    logging.info(f"Зарегистрирован: {user_id} - {fio}")
+    logging.info(f"Зарегистрирован: {user_id} - {fio} (@{username})")
 
 # === Блок 7: Обработка вопроса пользователя ===
 @bot.message_handler(func=lambda m: get_user_state(m.chat.id) == "waiting_for_question")
@@ -224,9 +254,9 @@ def process_date(message):
         bot.send_message(user_id, "❌ Неверный формат даты. Введите в формате: 25.10.2025 14:00")
         set_user_state(user_id, "waiting_for_date")
         logging.warning(f"[FORMAT ERROR] Пользователь {user_id} ввёл неправильную дату: {date_text}")
-        
+
         # 🔁 Повторный next_step_handler
-        bot.register_next_step_handler(message, process_date)
+        
         return
 
     # Теперь можно сбросить состояние
@@ -294,7 +324,7 @@ def handle_admin_decision(call):
     if status != 'pending':
         bot.answer_callback_query(call.id, "Эта заявка уже обработана.")
         return
-   
+
         db.execute('UPDATE requests SET status = ? WHERE id = ?', ('approved', request_id), commit=True)
 
     if action == 'approve':
@@ -302,7 +332,7 @@ def handle_admin_decision(call):
         db.execute('UPDATE requests SET status = ? WHERE id = ?', ('approved', request_id), commit=True)
 
         bot.send_message(user_id, f"✅ Ваша запись на {date_str} подтверждена. Ждём вас!")
-        bot.send_message(user_id, "💳 Реквизиты для оплаты:\n+7 922 000 0320\nСбербанк\nПожалуйста, отправьте фото вашего чека в этот чат для подтверждения оплаты.")
+        bot.send_message(user_id, "💳 Реквизиты для оплаты:\n+79251471030 (Сбербанк)\nПожалуйста, отправьте фото вашего чека в этот чат для подтверждения оплаты.")
         set_user_state(user_id, "waiting_for_payment")
         bot.send_message(GROUP_CHAT_ID, f"✅ Заявка #{request_id} подтверждена {call.from_user.first_name}.")
         logging.info(f"Заявка #{request_id} {'подтверждена' if action == 'approve' else 'отклонена'} админом {call.from_user.id}")
@@ -375,6 +405,39 @@ def handle_photo(message):
         logging.info(f"Получен чек от пользователя {user_id}: {caption}")
         return
 
+        # --- чек по мероприятию ---
+    if current_state and current_state.startswith("waiting_for_payment_"):
+        event_type = current_state.replace("waiting_for_payment_", "")
+        row = db.execute('SELECT fio FROM users WHERE user_id = ?', (user_id,), fetchone=True)
+        fio = row[0] if row else "Неизвестный пользователь"
+
+        db.execute(
+            'INSERT INTO payments (user_id, file_id, caption) VALUES (?, ?, ?)',
+             (user_id, file_id, f"[{event_type.upper()}] {caption}"),
+             commit=True
+        )
+
+        bot.send_photo(GROUP_CHAT_ID, file_id, caption=f"💰 Чек от {fio} за {event_type.upper()}:\n📝 {caption}")
+        bot.send_message(user_id, "✅ Спасибо! Чек получен. До встречи на мероприятии.")
+        set_user_state(user_id, None)
+        return
+
+    # === Афиша от админа ===
+    if message.caption:
+        hashtags = {
+            '#джем': 'jam',
+            '#опентолк': 'opentalk',
+            '#просмотр': 'watching'
+        }
+
+        for tag, event_type in hashtags.items():
+            if tag in message.caption.lower() and user_id in ADMIN_IDS:
+                db.execute('INSERT INTO events (file_id, caption, event_type) VALUES (?, ?, ?)',
+                           (file_id, caption, event_type), commit=True)
+                bot.send_message(user_id, f"✅ Афиша для {event_type.upper()} сохранена.")
+                return
+
+
     bot.send_message(user_id, "❌ Не удалось определить тип изображения.")
 
 # === админсчкие кнопки ===
@@ -404,13 +467,16 @@ def handle_admin_buttons(call):
         return
 
     if call.data == "show_users":
-        users = db.execute('SELECT user_id, fio FROM users', fetchall=True)
+        users = db.execute('SELECT user_id, fio, username FROM users', fetchall=True)
         if not users:
             bot.send_message(call.message.chat.id, "Нет зарегистрированных пользователей.")
         else:
             msg = "👥 Пользователи:\n"
-            for uid, fio in users:
-                msg += f"- {fio} (ID: {uid})\n"
+            for uid, fio, username in users:
+                user_line = f"- {fio} (ID: {uid})"
+                if username:
+                  user_line += f" — @{username}"
+                msg += user_line + "\n"
             bot.send_message(call.message.chat.id, msg)
 
     elif call.data == "show_requests":
@@ -457,6 +523,40 @@ def send_schedule_if_exists(user_id):
     else:
         bot.send_message(user_id, "⚠️ Расписание пока не загружено.")
 
+##Хендлер выбора типа мероприятия
+
+@bot.message_handler(func=lambda m: m.text in ["🎷 Джем", "🗣 Опентолк", "🎬 Просмотр"])
+def handle_event_selection(message):
+    user_id = message.chat.id
+    text = message.text
+
+    event_mapping = {
+        "🎷 Джем": "jam",
+        "🗣 Опентолк": "opentalk",
+        "🎬 Просмотр": "watching"
+    }
+
+    if text not in event_mapping:
+        bot.send_message(user_id, "❌ Пожалуйста, выберите мероприятие с клавиатуры.")
+        return
+
+    event_type = event_mapping[text]
+    result = db.execute('''
+        SELECT file_id, caption FROM events
+        WHERE event_type = ? ORDER BY timestamp DESC LIMIT 1
+    ''', (event_type,), fetchone=True)
+
+    if not result:
+        bot.send_message(user_id, "⚠️ Пока нет афиши для этого мероприятия.")
+        set_user_state(user_id, None)
+        return
+
+    file_id, caption = result
+    bot.send_photo(user_id, file_id, caption=caption)
+    bot.send_message(user_id, "💳 Переведите на +79251471030 (Сбербанк)\nПожалуйста, пришлите фото чека в этот чат.")
+
+    set_user_state(user_id, f"waiting_for_payment_{event_type}")
+
 # === Блок 13: Запуск бота ===
 logging.info("Бот запущен... Ожидаем события.")
 while True:
@@ -465,5 +565,3 @@ while True:
     except Exception as e:
         logging.exception("Ошибка в bot.polling:")
         time.sleep(5)
-
-        db.execute('INSERT INTO payments (user_id, file_id, caption) VALUES (?, ?, ?)', (user_id, file_id, caption), commit=True)
